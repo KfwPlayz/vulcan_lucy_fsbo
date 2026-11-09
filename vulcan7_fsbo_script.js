@@ -1,20 +1,56 @@
-// Vulcan7 FSBO lead sync (no move step)
-// Scrapes the FSBO view, skips leads already in the cache file, pulls each lead's
-// detail page, and sends it to the webhook.
+// Vulcan7 lead sync (FSBO)
+// Scrapes contacts from the FSBO view, sends each one to a webhook, and optionally
+// moves them into an EXISTING folder (it never creates folders). Settings that differ
+// between accounts or lists come from environment variables set in the workflow file.
 
 const puppeteer = require("puppeteer");
 const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// page.goto that survives "net::ERR_ABORTED" (another navigation or redirect cut ours off)
+async function gotoWithRetry(pg, url, attempts = 3) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await pg.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
+      return;
+    } catch (err) {
+      if (i === attempts) throw err;
+      console.warn(`Navigation failed (${i}/${attempts}): ${err.message}. Retrying...`);
+      await sleep(3000 * i);
+    }
+  }
+}
+
+// ---------- Config ----------
 const LOGIN_URL = "https://www.vulcan7dialer.com/login";
-const CONTACTS_URL = "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD05ODEzMyZwYWdlPTE=";
+
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const CACHE_FILE = path.join(__dirname, "sent-leads-cache-fsbo.json");
+const CONTACTS_URL = process.env.CONTACTS_URL ||
+  "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD05ODEzMyZwYWdlPTE=";
+
+const MOVE_CONTACTS = (process.env.MOVE_CONTACTS || "true").toLowerCase() === "true";
+const PHONE_CELL_ID = process.env.PHONE_CELL_ID || "143332"; // account specific column ids
+const EMAIL_CELL_ID = process.env.EMAIL_CELL_ID || "143333";
+const LIST_LABEL = process.env.LIST_LABEL || "FSBO"; // only used in log lines
+const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 150000); // leads listed below this are not sent
+const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1"; // dump labels + phone markup for the first lead
+
+if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
+  console.error("Missing config. EMAIL, PASSWORD and WEBHOOK_URL must all be set.");
+  process.exit(1);
+}
+
+// Destination folder. It must already exist in Vulcan7, the script only moves into it.
+const folderName = process.env.FOLDER_NAME || "FSBO Moved to GHL";
+
+// "$249,900" -> 249900. Returns null when the text has no readable number.
+function parsePrice(text) {
+  const n = parseFloat(String(text || "").replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
 
 // Every field the webhook expects, so a lead whose detail page fails still has all keys
 const DEFAULT_DETAIL = {
@@ -50,7 +86,7 @@ const DEFAULT_DETAIL = {
 
   const page = await browser.newPage();
 
-  // CI hardening: timeouts, UA, resource blocking, logs
+  // === CI hardening: timeouts, UA, resource blocking, logs ===
   page.setDefaultTimeout(120000);
   page.setDefaultNavigationTimeout(120000);
 
@@ -69,10 +105,11 @@ const DEFAULT_DETAIL = {
   page.on("console", (msg) => console.log("[BROWSER]", msg.type(), msg.text()));
   page.on("pageerror", (err) => console.log("[PAGEERROR]", err));
   page.on("requestfailed", (req) => console.log("[REQ FAILED]", req.url(), req.failure()?.errorText));
+  // === end CI hardening ===
 
   try {
     // ---------- Log in ----------
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await gotoWithRetry(page, LOGIN_URL);
     await page.waitForSelector('input[name="email"], #email, input[name="username"]', { timeout: 120000 });
     await page.waitForSelector('input[name="password"], #password', { timeout: 120000 });
 
@@ -81,7 +118,10 @@ const DEFAULT_DETAIL = {
       : (await page.$("#email"))
         ? "#email"
         : 'input[name="username"]';
-    const passSel = (await page.$('input[name="password"]')) ? 'input[name="password"]' : "#password";
+
+    const passSel = (await page.$('input[name="password"]'))
+      ? 'input[name="password"]'
+      : "#password";
 
     await page.type(emailSel, EMAIL, { delay: 20 });
     await page.type(passSel, PASSWORD, { delay: 20 });
@@ -91,25 +131,29 @@ const DEFAULT_DETAIL = {
       page.click('button[type="submit"], .login-button')
     ]);
 
-    // ---------- Scrape the FSBO list ----------
-    await page.goto(CONTACTS_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+    // Let the post-login dashboard finish its own redirects before navigating again
+    await sleep(3000);
+
+    // ---------- Scrape the contact list ----------
+    await gotoWithRetry(page, CONTACTS_URL);
     await page.waitForSelector("tr[data-itemid]", { timeout: 120000 });
     await sleep(1500);
 
-    const leads = await page.evaluate(() => {
+    const leads = await page.evaluate(({ phoneCell, emailCell }) => {
+      const rows = document.querySelectorAll("tr[data-itemid]");
       const out = [];
 
-      for (const row of document.querySelectorAll("tr[data-itemid]")) {
+      for (const row of rows) {
         const id = row.getAttribute("data-itemid");
-        const fullName = row.querySelector(".contact-details-link a")?.innerText?.trim();
+        const nameEl = row.querySelector(".contact-details-link a");
+        const fullName = nameEl?.innerText?.trim();
         if (!fullName) continue;
 
-        const phone = document.querySelector(`div[id='cell-example-${id}-143332']`)?.innerText?.trim() || "";
-        const email = document
-          .querySelector(`div[id='cell-example-${id}-143333'] a[href^='mailto:']`)
-          ?.getAttribute("href")
-          ?.replace("mailto:", "")
-          .trim() || "";
+        const phoneDiv = document.querySelector(`div[id='cell-example-${id}-${phoneCell}']`);
+        const phone = phoneDiv?.innerText?.trim() || "";
+
+        const emailEl = document.querySelector(`div[id='cell-example-${id}-${emailCell}'] a[href^='mailto:']`);
+        const email = emailEl?.getAttribute("href")?.replace("mailto:", "").trim() || "";
 
         const nameParts = fullName.split(" ");
         out.push({
@@ -123,52 +167,51 @@ const DEFAULT_DETAIL = {
       }
 
       return out;
-    });
+    }, { phoneCell: PHONE_CELL_ID, emailCell: EMAIL_CELL_ID });
 
-    console.log(`✅ Found ${leads.length} raw leads in "FSBO"`);
+    console.log(`✅ Found ${leads.length} raw leads in "${LIST_LABEL}"`);
 
-    // ---------- De-duplicate and skip anything already sent ----------
-    let sentCache = new Set();
-    if (fs.existsSync(CACHE_FILE)) {
-      try {
-        sentCache = new Set(JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8")));
-      } catch {
-        // ignore a bad cache file
-      }
-    }
-
-    // Each entry keeps the cache key from the list view, because lead.phone is
-    // overwritten with the detail-page phone later
-    const queue = [];
+    // ---------- De-duplicate ----------
     const seen = new Set();
+    const unsentLeads = [];
 
     for (const lead of leads) {
       const key = `${lead.full_name}|${lead.phone}`;
-      const isPossibleOwner = lead.full_name.toLowerCase() === "possible owner";
-
-      if (!isPossibleOwner && seen.has(key)) continue; // duplicate within this run
-      seen.add(key);
-
-      if (sentCache.has(key)) continue; // already sent on an earlier run
-      queue.push({ lead, key });
+      if (lead.full_name.toLowerCase() === "possible owner" || !seen.has(key)) {
+        seen.add(key);
+        unsentLeads.push(lead);
+      }
     }
 
-    console.log(`ℹ️ ${queue.length} new lead(s) to send (${leads.length - queue.length} skipped).`);
-
     // ---------- Pull details for each lead ----------
-    for (const { lead } of queue) {
+    let debugPrinted = false;
+
+    for (const lead of unsentLeads) {
       Object.assign(lead, DEFAULT_DETAIL);
 
       const detailPage = await browser.newPage();
 
       try {
         const detailUrl = `https://www.vulcan7dialer.com/cm/index#contact/${lead.contact_id}`;
-        await detailPage.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+        await gotoWithRetry(detailPage, detailUrl);
 
         await detailPage.waitForFunction(() => {
           const ths = Array.from(document.querySelectorAll("th"));
           return ths.some((th) => th.textContent.includes("MLS Number"));
         }, { timeout: 15000 });
+
+        // Optional: dump labels + phone markup once so selectors can be confirmed
+        if (DEBUG_FIELDS && !debugPrinted) {
+          debugPrinted = true;
+          const dump = await detailPage.evaluate(() => ({
+            labels: Array.from(document.querySelectorAll("tr th")).map((th) =>
+              (th.textContent || "").replace(/\s+/g, " ").trim()
+            ),
+            phonesHtml: document.querySelector('tbody[data-section="phones"]')?.outerHTML || "(no phones section)"
+          }));
+          console.log("🐞 Detail labels:", JSON.stringify(dump.labels));
+          console.log("🐞 Phones HTML:", dump.phonesHtml);
+        }
 
         const detailData = await detailPage.evaluate(() => {
           const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
@@ -254,8 +297,8 @@ const DEFAULT_DETAIL = {
                 parsed = JSON.parse(el.getAttribute("data-value") || "{}");
               } catch {}
 
-              const cleanNumber = (el.textContent || "")
-                .trim()
+              const rawText = (el.textContent || "").trim();
+              const cleanNumber = rawText
                 .replace(/\((Home|Work|Mobile|Fax|Other)\)/gi, "")
                 .trim();
 
@@ -283,6 +326,7 @@ const DEFAULT_DETAIL = {
 
           // Link grabber
           const links = Array.from(document.querySelectorAll("a[href]")).map((a) => a.getAttribute("href"));
+
           const matchLink = (pattern) => {
             const regex = new RegExp(pattern, "i");
             return links.find((href) => regex.test(href)) || "";
@@ -352,49 +396,216 @@ const DEFAULT_DETAIL = {
     }
 
     // ---------- Send to webhook ----------
-    // Only leads that were actually delivered go into the cache, so anything that
-    // fails is retried on the next run. A 404/410 means the webhook is dead, so stop.
-    const sentKeys = [];
-    let failedCount = 0;
+    // Retries each lead up to 3 times. A 404/410 means the webhook is dead, so stop
+    // right away. Any lead that still fails stops the run before the move step, so
+    // nothing gets moved out of the list unless it was delivered.
+    const failedLeads = [];
 
-    try {
-      for (const { lead, key } of queue) {
-        let ok = false;
+    // Price filter. List price only exists on the detail page, so this runs after the
+    // detail fetch. A lead with no readable price is still sent, so a failed detail
+    // page never silently drops a lead.
+    const toSend = [];
+    const belowMin = [];
 
-        for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
-          try {
-            const res = await axios.post(
-              WEBHOOK_URL,
-              { timestamp: new Date().toISOString(), lead },
-              { timeout: 30000 }
-            );
-            console.log(`📤 Sent: ${lead.full_name} (${res.status})`);
-            ok = true;
-          } catch (err) {
-            const status = err.response?.status;
-            console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}`);
+    for (const lead of unsentLeads) {
+      const price = parsePrice(lead.list_price);
 
-            if (status === 404 || status === 410) {
-              throw new Error(`Webhook returned ${status}. Stopping.`);
-            }
-            await sleep(1000 * attempt);
+      if (price !== null && price < MIN_LIST_PRICE) {
+        belowMin.push(lead);
+      } else {
+        if (price === null) console.log(`ℹ️ No readable list price for ${lead.full_name}, sending anyway.`);
+        toSend.push(lead);
+      }
+    }
+
+    console.log(`ℹ️ ${toSend.length} lead(s) at or above $${MIN_LIST_PRICE.toLocaleString("en-US")}, ${belowMin.length} below and not sent.`);
+    for (const lead of belowMin) {
+      console.log(`⏭️ Skipped (list price ${lead.list_price}): ${lead.full_name}`);
+    }
+
+    for (const lead of toSend) {
+      let ok = false;
+
+      for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+        try {
+          const res = await axios.post(
+            WEBHOOK_URL,
+            { timestamp: new Date().toISOString(), lead },
+            { timeout: 30000 }
+          );
+          console.log(`📤 Sent: ${lead.full_name} (${res.status})`);
+          ok = true;
+        } catch (err) {
+          const status = err.response?.status;
+          console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}`);
+
+          if (status === 404 || status === 410) {
+            throw new Error(`Webhook returned ${status}. Stopping before the move step.`);
           }
+          await sleep(1000 * attempt);
+        }
+      }
+
+      if (!ok) failedLeads.push(lead);
+      await sleep(500); // gentle pacing
+    }
+
+    if (failedLeads.length > 0) {
+      throw new Error(`${failedLeads.length} lead(s) failed to send. Skipping the move step.`);
+    }
+
+    if (!MOVE_CONTACTS) {
+      console.log("ℹ️ MOVE_CONTACTS is off, leaving contacts where they are.");
+      return;
+    }
+
+    // ---------- Move contacts ----------
+    await gotoWithRetry(page, CONTACTS_URL);
+    await page.waitForSelector("tr[data-itemid]", { timeout: 120000 });
+    await page.waitForSelector("#master_checkbox", { timeout: 120000 }); // no visible:true, it can read as hidden with images/fonts blocked
+    await sleep(5000); // let all rows render and the select-all handler bind
+
+    const readChecked = () =>
+      page.$eval("#master_checkbox", (el) => !!el.checked).catch(() => false);
+
+    // Try three ways to tick it: real click, DOM click, label click
+    const attempts = [
+      async () => { await page.click("#master_checkbox"); },
+      async () => {
+        await page.evaluate(() => {
+          const cb = document.querySelector("#master_checkbox");
+          cb.scrollIntoView({ block: "center" });
+          cb.click();
+        });
+      },
+      async () => {
+        await page.evaluate(() => {
+          const cb = document.querySelector("#master_checkbox");
+          const label = cb.closest("label") || document.querySelector(`label[for="${cb.id}"]`);
+          (label || cb.parentElement).click();
+        });
+      }
+    ];
+
+    let isChecked = await readChecked();
+    for (const attempt of attempts) {
+      if (isChecked) break;
+      try { await attempt(); } catch (e) { console.warn("Checkbox attempt failed:", e.message); }
+      await sleep(1000);
+      isChecked = await readChecked();
+    }
+
+    if (!isChecked) {
+      // Diagnostics so the next failure explains itself
+      const info = await page.evaluate(() => {
+        const cb = document.querySelector("#master_checkbox");
+        const r = cb?.getBoundingClientRect();
+        return {
+          rect: r ? { w: r.width, h: r.height, x: r.x, y: r.y } : null,
+          parentHtml: cb?.parentElement?.outerHTML?.slice(0, 500) || null
+        };
+      });
+      console.log("Master checkbox diagnostics:", JSON.stringify(info));
+      throw new Error("Master checkbox was not checked.");
+    }
+
+    console.log("✅ Selected all contacts via master checkbox.");
+
+    // Open move menu
+    await page.waitForSelector("#cm_move_button", { visible: true, timeout: 120000 });
+    await page.click("#cm_move_button");
+    await sleep(1500);
+
+    // Wait for dropdown items
+    await page.waitForFunction(() => {
+      return document.querySelectorAll("li.move-contacts-folder[title]").length > 0 ||
+             document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li").length > 0;
+    }, { timeout: 10000 });
+
+    // Click exact folder entry
+    const clickedFolder = await page.evaluate((targetFolderName) => {
+      const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+      let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
+      if (!items.length) {
+        items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
+      }
+
+      const matches = items.filter((item) =>
+        normalize(item.getAttribute("title") || item.textContent || "") === normalize(targetFolderName)
+      );
+
+      // Two folders with the same name (for example one under Off Market and one under
+      // FSBO): refuse to guess, because a wrong guess moves contacts into the wrong folder.
+      if (matches.length > 1) return "multiple";
+      if (matches.length === 0) return false;
+
+      const item = matches[0];
+      const link =
+        item.querySelector("a.move-to-folder") ||
+        item.querySelector("a") ||
+        item;
+
+      link.scrollIntoView({ block: "center" });
+      link.click();
+      return true;
+    }, folderName);
+
+    if (clickedFolder === "multiple") {
+      throw new Error(`More than one folder is named "${folderName}". Rename one in Vulcan7 or set FOLDER_NAME to a unique name.`);
+    }
+
+    if (!clickedFolder) {
+      const available = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("li.move-contacts-folder[title]")).map((li) => li.getAttribute("title"))
+      );
+      console.log("Folders offered in the move menu:", JSON.stringify(available));
+      throw new Error(`Could not find move folder "${folderName}". Create it in Vulcan7 first, then re-run.`);
+    }
+
+    console.log(`✅ Clicked folder "${folderName}" in move menu.`);
+    await sleep(1500);
+
+    // Confirm modal if it appears
+    try {
+      await page.waitForSelector("#bulk_actions_modal", { visible: true, timeout: 5000 });
+
+      const confirmed = await page.evaluate(() => {
+        const modal = document.querySelector("#bulk_actions_modal");
+        if (!modal) return false;
+
+        const buttons = Array.from(modal.querySelectorAll("button"));
+        const btn = buttons.find((b) =>
+          /okay|ok|move|confirm/i.test((b.textContent || "").trim())
+        );
+
+        if (btn) {
+          btn.click();
+          return true;
         }
 
-        if (ok) sentKeys.push(key);
-        else failedCount++;
+        const primary = modal.querySelector("button.btn.btn-primary");
+        if (primary) {
+          primary.click();
+          return true;
+        }
 
-        await sleep(500); // gentle pacing
+        return false;
+      });
+
+      if (confirmed) {
+        console.log("🟢 Confirmed move modal.");
+        await sleep(3000);
+      } else {
+        console.warn("⚠️ Move modal appeared, but confirm button was not found.");
       }
-    } finally {
-      // Save progress even if the loop aborted part way through
-      fs.writeFileSync(CACHE_FILE, JSON.stringify([...sentCache, ...sentKeys], null, 2));
-      console.log(`💾 Cache updated with ${sentKeys.length} new lead(s).`);
+    } catch {
+      console.log("ℹ️ No confirmation modal appeared.");
     }
 
-    if (failedCount > 0) {
-      throw new Error(`${failedCount} lead(s) failed to send and will be retried next run.`);
-    }
+    // Give Vulcan7 time to process
+    await sleep(4000);
+    console.log(`✅ Move attempt finished for folder "${folderName}"`);
   } catch (err) {
     console.error("❌ Script Error:", err);
     try {
