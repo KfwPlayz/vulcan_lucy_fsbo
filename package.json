@@ -1,0 +1,11 @@
+{
+  "name": "vulcan7-fsbo-runner",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "puppeteer": "^22.15.0"
+  }
+}
+
+
