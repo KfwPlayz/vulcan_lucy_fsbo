@@ -44,7 +44,7 @@ if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
 }
 
 // Destination folder. It must already exist in Vulcan7, the script only moves into it.
-const folderName = process.env.FOLDER_NAME || "FSBO Moved to GHL";
+const folderName = process.env.FOLDER_NAME || "Moved to GHL";
 
 // "$249,900" -> 249900. Returns null when the text has no readable number.
 function parsePrice(text) {
@@ -68,6 +68,36 @@ const DEFAULT_DETAIL = {
   phone_3: "", phone_3_dnc: "",
   phone_4: "", phone_4_dnc: "",
   phone_5: "", phone_5_dnc: ""
+};
+
+// Runs inside the page. Finds the move-menu entry for the target folder and clicks it.
+// The same folder can be listed in more than one menu on the page (Move, Actions), so
+// entries that are actually showing win over hidden ones.
+const selectFolderInPage = (targetFolderName) => {
+  const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const titleOf = (el) => normalize(el.getAttribute("title") || el.textContent || "");
+  const target = normalize(targetFolderName);
+
+  let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
+  if (!items.length) {
+    items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
+  }
+
+  const matches = items.filter((el) => titleOf(el) === target);
+  if (matches.length === 0) return { status: "missing" };
+
+  // The Move menu was just opened, so its entries are the visible ones
+  const visible = matches.filter((el) => el.getClientRects().length > 0);
+  const item = (visible.length ? visible : matches)[0];
+
+  const link =
+    item.querySelector("a.move-to-folder") ||
+    item.querySelector("a") ||
+    item;
+
+  link.scrollIntoView({ block: "center" });
+  link.click();
+  return { status: "clicked", matches: matches.length, visible: visible.length };
 };
 
 (async () => {
@@ -523,39 +553,9 @@ const DEFAULT_DETAIL = {
     }, { timeout: 10000 });
 
     // Click exact folder entry
-    const clickedFolder = await page.evaluate((targetFolderName) => {
-      const normalize = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const picked = await page.evaluate(selectFolderInPage, folderName);
 
-      let items = Array.from(document.querySelectorAll("li.move-contacts-folder[title]"));
-      if (!items.length) {
-        items = Array.from(document.querySelectorAll("#cm_move_dropdown li, .dropdown-menu li"));
-      }
-
-      const matches = items.filter((item) =>
-        normalize(item.getAttribute("title") || item.textContent || "") === normalize(targetFolderName)
-      );
-
-      // Two folders with the same name (for example one under Off Market and one under
-      // FSBO): refuse to guess, because a wrong guess moves contacts into the wrong folder.
-      if (matches.length > 1) return "multiple";
-      if (matches.length === 0) return false;
-
-      const item = matches[0];
-      const link =
-        item.querySelector("a.move-to-folder") ||
-        item.querySelector("a") ||
-        item;
-
-      link.scrollIntoView({ block: "center" });
-      link.click();
-      return true;
-    }, folderName);
-
-    if (clickedFolder === "multiple") {
-      throw new Error(`More than one folder is named "${folderName}". Rename one in Vulcan7 or set FOLDER_NAME to a unique name.`);
-    }
-
-    if (!clickedFolder) {
+    if (picked.status === "missing") {
       const available = await page.evaluate(() =>
         Array.from(document.querySelectorAll("li.move-contacts-folder[title]")).map((li) => li.getAttribute("title"))
       );
@@ -563,7 +563,13 @@ const DEFAULT_DETAIL = {
       throw new Error(`Could not find move folder "${folderName}". Create it in Vulcan7 first, then re-run.`);
     }
 
-    console.log(`✅ Clicked folder "${folderName}" in move menu.`);
+    console.log(
+      `✅ Clicked folder "${folderName}" in move menu ` +
+      `(${picked.matches} matching entr${picked.matches === 1 ? "y" : "ies"}, ${picked.visible} visible).`
+    );
+    if (picked.visible > 1) {
+      console.warn("⚠️ More than one visible entry has this name and the first was clicked. If contacts land in the wrong folder, give the folders unique names.");
+    }
     await sleep(1500);
 
     // Confirm modal if it appears
