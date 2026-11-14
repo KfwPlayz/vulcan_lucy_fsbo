@@ -1,29 +1,44 @@
-name: Daily Vulcan7 FSBO Job
+name: Daily Vulcan7 FSBO Job Lucy
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # triggered by cron-job.org, no GitHub schedule
 
 permissions:
   contents: read
 
+# Never let two runs overlap. A second run waits instead of cancelling the first,
+# so a run that is mid-send is never cut off.
 concurrency:
   group: v7-daily-${{ github.ref }}
   cancel-in-progress: false
-  
+
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
+      # Secrets (one set per repo)
       EMAIL: ${{ secrets.EMAIL }}
       PASSWORD: ${{ secrets.PASSWORD }}
-      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      GHL_TOKEN: ${{ secrets.GHL_TOKEN }}   # Private Integration token created INSIDE Lucy's own GHL account
+
+      # ---- GoHighLevel ----
+      GHL_LOCATION_ID: "TZfTgN59dTmTOolfOQNP"
+      GHL_TAGS: "vulcan lucy fsbo"        # comma separated, added to the contact (existing tags are kept)
+      GHL_SOURCE: "vulcan"
+
+      # ---- Vulcan7 ----
+      # CONTACTS_URL is NOT set here: the script's built-in default is the FSBO view
+      MOVE_CONTACTS: "true"                # TEST RUN FIRST. Change to "true" after checking the contacts in GHL
+      FOLDER_NAME: "FSBO Moved to GHL"
+      LIST_LABEL: "FSBO"                 # only used in log lines
+      MIN_LIST_PRICE: "150000"
+      PHONE_CELL_ID: "143332"               # account specific column ids
+      EMAIL_CELL_ID: "143333"
+      # DEBUG_FIELDS: "1"                   # uncomment once to log detail-page labels for the first lead
+
       PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
-      - name: Compute ET date
-        id: date
-        run: echo "DATE_ET=$(TZ=America/New_York date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -32,12 +47,6 @@ jobs:
 
       - name: Install deps
         run: npm install --no-audit --no-fund
-
-      - name: Restore dedupe cache (today only)
-        uses: actions/cache@v4
-        with:
-          path: sent-leads-cache-fsbo.json
-          key: fsbo-cache-${{ steps.date.outputs.DATE_ET }}
 
       - name: Use preinstalled Chrome
         run: echo "PUPPETEER_EXECUTABLE_PATH=$(which google-chrome)" >> $GITHUB_ENV
@@ -50,8 +59,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-artifacts
-          path: |
-            failure.png
-            failure_move.png
-            sent-leads-cache-fsbo.json
+          path: failure*.png
           if-no-files-found: ignore
