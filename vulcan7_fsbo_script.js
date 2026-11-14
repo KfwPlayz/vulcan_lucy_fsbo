@@ -1,7 +1,8 @@
-// Vulcan7 lead sync (FSBO)
-// Scrapes contacts from the FSBO view, sends each one to a webhook, and optionally
-// moves them into an EXISTING folder (it never creates folders). Settings that differ
-// between accounts or lists come from environment variables set in the workflow file.
+// Vulcan7 lead sync (FSBO) - direct to GoHighLevel
+// Scrapes contacts from the FSBO view and creates/updates each one in GoHighLevel through the
+// API (no Zapier), then optionally moves them into an EXISTING Vulcan7 folder (it never
+// creates folders). Settings that differ between accounts or lists come from environment
+// variables set in the workflow file.
 
 const puppeteer = require("puppeteer");
 const axios = require("axios");
@@ -27,7 +28,11 @@ const LOGIN_URL = "https://www.vulcan7dialer.com/login";
 
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const GHL_TOKEN = process.env.GHL_TOKEN;                 // Private Integration token (GitHub secret)
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;     // sub-account (location) id
+const GHL_SOURCE = process.env.GHL_SOURCE || "vulcan";
+// Comma separated. Added to the contact, existing tags are kept.
+const GHL_TAGS = (process.env.GHL_TAGS || "vulcan lucy fsbo").split(",").map((t) => t.trim()).filter(Boolean);
 const CONTACTS_URL = process.env.CONTACTS_URL ||
   "https://www.vulcan7dialer.com/cm/index#params/dmlld19pZD05ODEzMyZwYWdlPTE=";
 
@@ -38,8 +43,8 @@ const LIST_LABEL = process.env.LIST_LABEL || "FSBO"; // only used in log lines
 const MIN_LIST_PRICE = Number(process.env.MIN_LIST_PRICE || 150000); // leads listed below this are not sent
 const DEBUG_FIELDS = process.env.DEBUG_FIELDS === "1"; // dump labels + phone markup for the first lead
 
-if (!EMAIL || !PASSWORD || !WEBHOOK_URL) {
-  console.error("Missing config. EMAIL, PASSWORD and WEBHOOK_URL must all be set.");
+if (!EMAIL || !PASSWORD || !GHL_TOKEN || !GHL_LOCATION_ID) {
+  console.error("Missing config. EMAIL, PASSWORD, GHL_TOKEN and GHL_LOCATION_ID must all be set.");
   process.exit(1);
 }
 
@@ -52,7 +57,7 @@ function parsePrice(text) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Every field the webhook expects, so a lead whose detail page fails still has all keys
+// Every field the script collects, so a lead whose detail page fails still has all keys
 const DEFAULT_DETAIL = {
   street: "", city: "", state: "", zip: "",
   mls_number: "", property_type: "", mls_status: "", status_change_date: "", list_price: "",
@@ -69,6 +74,214 @@ const DEFAULT_DETAIL = {
   phone_4: "", phone_4_dnc: "",
   phone_5: "", phone_5_dnc: ""
 };
+
+// ---------- GoHighLevel ----------
+const GHL_BASE = process.env.GHL_BASE_URL || "https://services.leadconnectorhq.com"; // override only for testing
+const GHL_VERSION = "2021-07-28";
+
+// Script field -> GHL custom field name(s). Matching ignores case, spaces and punctuation,
+// and also tries the field key. Every field that matches gets the value, and if two fields
+// share a name (one per folder, say) both get it. The names below are the ones in Lucy's
+// account (Vulcan Info, All Phone Numbers and Contact folders) plus the extra names the Zap
+// used (Beds, Sqft, Price, Current Address, Property Address, Twitter, TikTok).
+// Add or rename names without editing the script by setting GHL_FIELD_MAP, for example
+// {"zillow_link":["Zillow URL"],"twitter":["X Profile"]}
+const FIELD_LABELS = {
+  street: ["Street Address", "Current Address", "Property Address"],
+  mls_number: ["MLS Number"],
+  property_type: ["Property Type"],
+  mls_status: ["MLS Status"],
+  status_change_date: ["Status Change Date"],
+  list_price: ["List Price", "Price"],
+  beds: ["Bedrooms", "Beds"],
+  baths: ["Bathrooms", "Baths"],
+  square_footage: ["Square Footage", "Sqft"],
+  days_on_market: ["Days on Market"],
+  listing_agent: ["Listing Agent"],
+  listing_office: ["Listing Office"],
+  zillow_link: ["Zillow Link"],
+  google_maps_link: ["Google Maps Link"],
+  facebook: ["Facebook"],
+  instagram: ["Instagram"],
+  linkedin: ["LinkedIn"],
+  twitter: ["Twitter"],
+  tiktok: ["TikTok"],
+  youtube: ["YouTube"],
+  owner_2_first_name: ["Owner 2 First Name"],
+  owner_2_last_name: ["Owner 2 Last Name"],
+  date_added: ["Date Added (Vulcan)"],
+  // Phone 1 is the contact's main phone (standard Phone field, set separately). Its DNC flag
+  // goes to "Phone DNC Status".
+  phone_1_dnc: ["Phone DNC Status", "Phone 1 DNC Status"],
+  phone_2: ["Phone 2"], phone_2_dnc: ["Phone 2 DNC Status"],
+  phone_3: ["Phone 3"], phone_3_dnc: ["Phone 3 DNC Status"],
+  phone_4: ["Phone 4"], phone_4_dnc: ["Phone 4 DNC Status"],
+  phone_5: ["Phone 5"], phone_5_dnc: ["Phone 5 DNC Status"]
+};
+
+// These exist in Lucy's account, so the run stops before scraping if one cannot be found.
+// Set GHL_ALLOW_MISSING_FIELDS=1 to continue without them.
+const REQUIRED_FIELD_KEYS = [
+  "street", "list_price", "beds", "square_footage", "days_on_market", "google_maps_link",
+  "owner_2_first_name", "owner_2_last_name",
+  "phone_3", "phone_4", "phone_2_dnc", "phone_4_dnc", "phone_5_dnc"
+];
+
+const normLabel = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// "+13057838988" for 10 digit US numbers. Anything else is passed through as typed.
+function toPhone(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return "";
+  const digits = t.replace(/\D/g, "");
+  if (t.startsWith("+")) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return t;
+}
+
+async function initGhl() {
+  const http = axios.create({
+    baseURL: GHL_BASE,
+    timeout: 30000,
+    headers: {
+      Authorization: `Bearer ${GHL_TOKEN}`,
+      Version: GHL_VERSION,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    }
+  });
+
+  let res;
+  try {
+    res = await http.get(`/locations/${GHL_LOCATION_ID}/customFields`, { params: { model: "contact" } });
+  } catch (err) {
+    const body = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 300)}` : "";
+    throw new Error(`Could not read custom fields from GoHighLevel (${err.response?.status || err.message}).${body} The token needs the scopes contacts.write and locations/customFields.readonly, and GHL_LOCATION_ID must belong to the same sub-account as the token.`);
+  }
+
+  const fields = res.data?.customFields || [];
+  if (!fields.length) {
+    throw new Error("GoHighLevel returned no contact custom fields for this location. Wrong GHL_LOCATION_ID, or the token cannot see custom fields.");
+  }
+
+  // name or key -> every field that has it
+  const index = new Map();
+  const addIndex = (k, f) => {
+    if (!k) return;
+    if (!index.has(k)) index.set(k, []);
+    if (!index.get(k).includes(f)) index.get(k).push(f);
+  };
+  for (const f of fields) {
+    addIndex(normLabel(f.name), f);
+    if (f.fieldKey) addIndex(normLabel(String(f.fieldKey).replace(/^contact\./, "")), f);
+  }
+
+  let labels = FIELD_LABELS;
+  if (process.env.GHL_FIELD_MAP) {
+    try {
+      labels = { ...FIELD_LABELS, ...JSON.parse(process.env.GHL_FIELD_MAP) };
+    } catch (e) {
+      throw new Error(`GHL_FIELD_MAP is not valid JSON: ${e.message}`);
+    }
+  }
+
+  const map = {};      // script key -> [GHL field objects]
+  const unmatched = [];
+  for (const [key, names] of Object.entries(labels)) {
+    const hits = [];
+    for (const n of [].concat(names)) {
+      for (const f of index.get(normLabel(n)) || []) {
+        if (!hits.includes(f)) hits.push(f);
+      }
+    }
+    if (hits.length) map[key] = hits; else unmatched.push(key);
+  }
+
+  console.log(`ℹ️ GHL: ${fields.length} contact custom fields found. Script fields mapped:`);
+  for (const [key, hits] of Object.entries(map)) {
+    console.log(`   ${key} -> ${hits.map((f) => `"${f.name}" {${f.fieldKey}} [${f.dataType}]`).join(", ")}`);
+  }
+  if (unmatched.length) {
+    console.warn(`⚠️ No GHL custom field found for: ${unmatched.join(", ")}. These values are NOT sent.`);
+  }
+
+  const missingRequired = REQUIRED_FIELD_KEYS.filter((k) => !map[k]);
+  if (missingRequired.length && process.env.GHL_ALLOW_MISSING_FIELDS !== "1") {
+    throw new Error(`Required GHL custom fields not found for: ${missingRequired.join(", ")}. Fix the field names, set GHL_FIELD_MAP, or set GHL_ALLOW_MISSING_FIELDS=1 to run without them.`);
+  }
+
+  return { http, map, verified: false };
+}
+
+// Creates or updates one contact, then adds the tags. Safe to retry: the upsert matches on
+// phone/email, and adding a tag that is already there changes nothing.
+async function sendLeadToGhl(ghl, lead) {
+  const clean = (v) => String(v ?? "").trim();
+
+  const customFields = [];
+  for (const [key, fields] of Object.entries(ghl.map)) {
+    const value = clean(lead[key]);
+    if (!value) continue; // never overwrite existing data with a blank
+
+    for (const f of fields) {
+      let fieldValue = value;
+      if (f.dataType === "MONETORY" || f.dataType === "NUMERICAL") {
+        const n = parsePrice(value);
+        if (n === null) continue;
+        fieldValue = n;
+      }
+      // Both spellings are accepted by the API (field_value is the older one)
+      customFields.push({ id: f.id, fieldValue, field_value: fieldValue });
+    }
+  }
+
+  const body = {
+    locationId: GHL_LOCATION_ID,
+    firstName: clean(lead.first_name),
+    lastName: clean(lead.last_name),
+    name: clean(lead.full_name),
+    email: clean(lead.email),
+    phone: toPhone(lead.phone),
+    address1: clean(lead.street),
+    city: clean(lead.city),
+    state: clean(lead.state),
+    postalCode: clean(lead.zip),
+    source: GHL_SOURCE,
+    customFields
+  };
+  for (const k of Object.keys(body)) {
+    if (body[k] === "") delete body[k];
+  }
+
+  const up = await ghl.http.post("/contacts/upsert", body);
+  const contactId = up.data?.contact?.id;
+  if (!contactId) {
+    throw new Error(`Upsert returned no contact id (HTTP ${up.status}): ${JSON.stringify(up.data).slice(0, 200)}`);
+  }
+
+  if (GHL_TAGS.length) {
+    await ghl.http.post(`/contacts/${contactId}/tags`, { tags: GHL_TAGS });
+  }
+
+  // Check the first lead by reading the contact back, so custom fields that are silently
+  // dropped show up in the log on the very first lead instead of after the whole run.
+  if (!ghl.verified) {
+    ghl.verified = true;
+    try {
+      const back = await ghl.http.get(`/contacts/${contactId}`);
+      const stored = (back.data?.contact?.customFields || []).filter((c) => c.value !== "" && c.value != null);
+      console.log(`🔎 Check on first lead (${lead.full_name}): sent ${customFields.length} custom field values, GHL shows ${stored.length} filled.`);
+      if (customFields.length && !stored.length) {
+        console.warn("⚠️ GHL stored NO custom field values for the first lead. Check the field mapping above and the token scopes.");
+      }
+    } catch (e) {
+      console.log(`ℹ️ Could not read the first contact back (${e.response?.status || e.message}). Open it in GHL to check the custom fields. (Reading needs the contacts.readonly scope.)`);
+    }
+  }
+
+  return { contactId, isNew: up.data?.new === true };
+}
 
 // Runs inside the page. Finds the move-menu entry for the target folder and clicks it.
 // The same folder can be listed in more than one menu on the page (Move, Actions), so
@@ -138,6 +351,10 @@ const selectFolderInPage = (targetFolderName) => {
   // === end CI hardening ===
 
   try {
+    // Check the GHL token, location and custom fields BEFORE scraping, so a bad setup
+    // fails in seconds instead of after every detail page has been fetched.
+    const ghl = await initGhl();
+
     // ---------- Log in ----------
     await gotoWithRetry(page, LOGIN_URL);
     await page.waitForSelector('input[name="email"], #email, input[name="username"]', { timeout: 120000 });
@@ -185,6 +402,7 @@ const selectFolderInPage = (targetFolderName) => {
         const emailEl = document.querySelector(`div[id='cell-example-${id}-${emailCell}'] a[href^='mailto:']`);
         const email = emailEl?.getAttribute("href")?.replace("mailto:", "").trim() || "";
 
+        const dateMatch = (row.innerText || "").match(/([A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2}\s?[ap]m)/i);
         const nameParts = fullName.split(" ");
         out.push({
           full_name: fullName,
@@ -192,7 +410,8 @@ const selectFolderInPage = (targetFolderName) => {
           last_name: nameParts.slice(1).join(" "),
           phone,
           email,
-          contact_id: id
+          contact_id: id,
+          date_added: dateMatch ? dateMatch[1] : ""
         });
       }
 
@@ -200,6 +419,7 @@ const selectFolderInPage = (targetFolderName) => {
     }, { phoneCell: PHONE_CELL_ID, emailCell: EMAIL_CELL_ID });
 
     console.log(`✅ Found ${leads.length} raw leads in "${LIST_LABEL}"`);
+    console.log(`ℹ️ Date Added read for ${leads.filter((l) => l.date_added).length} of ${leads.length} leads${leads[0] ? ` (first: "${leads[0].date_added}")` : ""}.`);
 
     // ---------- De-duplicate ----------
     const seen = new Set();
@@ -225,10 +445,18 @@ const selectFolderInPage = (targetFolderName) => {
         const detailUrl = `https://www.vulcan7dialer.com/cm/index#contact/${lead.contact_id}`;
         await gotoWithRetry(detailPage, detailUrl);
 
-        await detailPage.waitForFunction(() => {
-          const ths = Array.from(document.querySelectorAll("th"));
-          return ths.some((th) => th.textContent.includes("MLS Number"));
-        }, { timeout: 15000 });
+        try {
+          await detailPage.waitForFunction(() => {
+            const ths = Array.from(document.querySelectorAll("th"));
+            return ths.some((th) => th.textContent.includes("MLS Number"));
+          }, { timeout: 15000 });
+        } catch (waitErr) {
+          console.warn(`⚠️ No MLS data on the detail page for ${lead.full_name}, reading the phones and address only.`);
+          await detailPage.waitForFunction(
+            () => document.querySelector('tbody[data-section="phones"] a[data-type="phone"], a[data-type="address"]'),
+            { timeout: 10000 }
+          );
+        }
 
         // Optional: dump labels + phone markup once so selectors can be confirmed
         if (DEBUG_FIELDS && !debugPrinted) {
@@ -425,10 +653,11 @@ const selectFolderInPage = (targetFolderName) => {
       }
     }
 
-    // ---------- Send to webhook ----------
-    // Retries each lead up to 3 times. A 404/410 means the webhook is dead, so stop
-    // right away. Any lead that still fails stops the run before the move step, so
-    // nothing gets moved out of the list unless it was delivered.
+    // ---------- Send to GoHighLevel ----------
+    // Retries each lead up to 3 times. A 401/403 means the token or location is wrong, so
+    // stop right away. A 400/422 (bad data) is not retried. Any lead that still fails stops
+    // the run before the move step, so nothing gets moved out of the list unless it was
+    // delivered.
     const failedLeads = [];
 
     // Price filter. List price only exists on the detail page, so this runs after the
@@ -453,25 +682,27 @@ const selectFolderInPage = (targetFolderName) => {
       console.log(`⏭️ Skipped (list price ${lead.list_price}): ${lead.full_name}`);
     }
 
+    let created = 0, updated = 0;
+
     for (const lead of toSend) {
       let ok = false;
 
       for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
         try {
-          const res = await axios.post(
-            WEBHOOK_URL,
-            { timestamp: new Date().toISOString(), lead },
-            { timeout: 30000 }
-          );
-          console.log(`📤 Sent: ${lead.full_name} (${res.status})`);
+          const r = await sendLeadToGhl(ghl, lead);
+          if (r.isNew) created++; else updated++;
+          console.log(`📤 Sent: ${lead.full_name} (${r.isNew ? "created" : "updated"}, ${r.contactId})`);
           ok = true;
         } catch (err) {
           const status = err.response?.status;
-          console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}`);
+          const body = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 300)}` : "";
+          console.error(`❌ Send failed (${attempt}/3) for ${lead.full_name}: ${err.message}${body}`);
 
-          if (status === 404 || status === 410) {
-            throw new Error(`Webhook returned ${status}. Stopping before the move step.`);
+          if (status === 401 || status === 403) {
+            throw new Error(`GoHighLevel returned ${status}. Check GHL_TOKEN scopes and GHL_LOCATION_ID. Stopping before the move step.`);
           }
+          // Other 4xx means the data was rejected, retrying the same data will not help
+          if (status && status >= 400 && status < 500 && status !== 429) break;
           await sleep(1000 * attempt);
         }
       }
@@ -479,6 +710,8 @@ const selectFolderInPage = (targetFolderName) => {
       if (!ok) failedLeads.push(lead);
       await sleep(500); // gentle pacing
     }
+
+    console.log(`ℹ️ GHL: ${created} created, ${updated} updated, ${failedLeads.length} failed.`);
 
     if (failedLeads.length > 0) {
       throw new Error(`${failedLeads.length} lead(s) failed to send. Skipping the move step.`);
