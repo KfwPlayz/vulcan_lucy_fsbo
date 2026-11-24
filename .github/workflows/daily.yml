@@ -36,6 +36,8 @@ jobs:
       EMAIL_CELL_ID: "143333"
       # DEBUG_FIELDS: "1"                   # uncomment once to log detail-page labels for the first lead
 
+      TERMS_SIGNATURE_NAME: "Lucia Celada"   # signs the Vulcan7 Terms of Service page if it appears
+
       PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
