@@ -1,4 +1,4 @@
-name: Daily Vulcan7 FSBO Job Lucy
+name: Daily Vulcan7 FSBO Job (Lucy)
 
 on:
   workflow_dispatch:   # triggered by cron-job.org, no GitHub schedule
