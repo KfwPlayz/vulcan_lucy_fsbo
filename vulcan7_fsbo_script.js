@@ -11,16 +11,69 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // page.goto that survives "net::ERR_ABORTED" (another navigation or redirect cut ours off)
 async function gotoWithRetry(pg, url, attempts = 3) {
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      await pg.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-      return;
-    } catch (err) {
-      if (i === attempts) throw err;
-      console.warn(`Navigation failed (${i}/${attempts}): ${err.message}. Retrying...`);
-      await sleep(3000 * i);
+  for (let pass = 1; pass <= 2; pass++) {
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        await pg.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
+        break;
+      } catch (err) {
+        if (i === attempts) throw err;
+        console.warn(`Navigation failed (${i}/${attempts}): ${err.message}. Retrying...`);
+        await sleep(3000 * i);
+      }
     }
+    // If Vulcan7 sent us to a disclaimer page instead, deal with it, then load the page again
+    if (!(await handleDisclaimer(pg))) return;
   }
+  throw new Error(`Vulcan7 keeps redirecting to a disclaimer page when opening ${url}`);
+}
+
+// Vulcan7 puts a "Terms & Conditions of Service" page (dashboard/disclaimer?disclaimer_id=...) in
+// front of every other page until it is accepted, and the page asks for the account owner's full
+// name as a signature. Without handling it the contact list never loads and the run just times
+// out. Returns false when no such page is showing, true when it was accepted.
+// The script only signs when TERMS_SIGNATURE_NAME is set in the workflow (the account owner's
+// full name). Without it the script reports the page and stops, so it never signs by surprise.
+async function handleDisclaimer(pg) {
+  if (!/\/disclaimer/i.test(pg.url())) return false;
+
+  const text = await pg.evaluate(() => (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 400));
+  console.warn(`⚠️ Vulcan7 is showing a terms page (${pg.url()}): "${text}"`);
+  try { await pg.screenshot({ path: "failure_disclaimer.png", fullPage: true }); } catch (e) {}
+
+  const signature = (process.env.TERMS_SIGNATURE_NAME || "").trim();
+  if (!signature) {
+    throw new Error(
+      "Vulcan7 is asking this account to accept its Terms of Service before it will show any contacts. " +
+      "Accept it once in Vulcan7 yourself, or set TERMS_SIGNATURE_NAME in the workflow to the account " +
+      "owner's full name so the script signs and accepts."
+    );
+  }
+
+  const sigSel = "#signature, input[name='signature']";
+  if (!(await pg.$(sigSel))) {
+    throw new Error("The Vulcan7 terms page has no signature box where one was expected, so the script did not sign it.");
+  }
+  const btnSel = "button.tc-accept, button[form='tc-agree-form']";
+  if (!(await pg.$(btnSel))) {
+    throw new Error("The Vulcan7 terms page has no I Accept button where one was expected.");
+  }
+
+  await pg.click(sigSel, { clickCount: 3 });
+  await pg.type(sigSel, signature, { delay: 30 });
+  console.log(`ℹ️ Signing the Vulcan7 terms as "${signature}".`);
+
+  await Promise.all([
+    pg.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {}),
+    pg.click(btnSel)
+  ]);
+  await sleep(2000);
+
+  if (/\/disclaimer/i.test(pg.url())) {
+    throw new Error("Still on the Vulcan7 terms page after clicking I Accept. Check that TERMS_SIGNATURE_NAME matches the account owner's full name.");
+  }
+  console.log("✅ Vulcan7 terms accepted.");
+  return true;
 }
 
 // ---------- Config ----------
@@ -380,6 +433,7 @@ const selectFolderInPage = (targetFolderName) => {
 
     // Let the post-login dashboard finish its own redirects before navigating again
     await sleep(3000);
+    await handleDisclaimer(page); // stops early with a clear message if Vulcan7 wants a disclaimer accepted
 
     // ---------- Scrape the contact list ----------
     await gotoWithRetry(page, CONTACTS_URL);
