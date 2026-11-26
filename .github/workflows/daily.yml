@@ -31,7 +31,7 @@ jobs:
       MOVE_CONTACTS: "true"                # TEST RUN FIRST. Change to "true" after checking the contacts in GHL
       FOLDER_NAME: "FSBO Moved to GHL"
       LIST_LABEL: "FSBO"                 # only used in log lines
-      MIN_LIST_PRICE: "150000"
+      MIN_LIST_PRICE: "250000"
       PHONE_CELL_ID: "143332"               # account specific column ids
       EMAIL_CELL_ID: "143333"
       # DEBUG_FIELDS: "1"                   # uncomment once to log detail-page labels for the first lead
